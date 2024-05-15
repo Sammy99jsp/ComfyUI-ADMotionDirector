@@ -3,7 +3,9 @@ import math
 import random
 import logging
 import datetime
+import itertools
 
+from dataclasses import dataclass
 from pathlib import Path
 from tqdm.auto import tqdm
 from einops import rearrange
@@ -16,6 +18,9 @@ from diffusers import AutoencoderKL, DDIMScheduler, DDPMScheduler
 from diffusers.optimization import get_scheduler
 
 from transformers import CLIPTextModel, CLIPTokenizer
+from dataclasses import dataclass
+
+import transformers.modeling_outputs
 
 from .animatediff.models.unet import UNet3DConditionModel
 from .animatediff.pipelines.pipeline_animation import AnimationPipeline
@@ -37,6 +42,10 @@ try:
     XFORMERS_IS_AVAILABLE = True
 except:
     XFORMERS_IS_AVAILABLE = False
+
+import typing
+from typing import Union
+import torch.amp
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 folder_paths.add_model_folder_path("animatediff_models", str(Path(__file__).parent.parent / "models"))
@@ -85,20 +94,14 @@ def resize_and_pad_images(images, output_size):
     return padded_images
 
 def do_sanity_check(
-    sanity_check,  
+    sanity_check: list[torch.Tensor],  
     output_dir,
     text_prompt
 ):
-    if isinstance(sanity_check, list):
-        resized_images = []
-        for image in sanity_check:
-            image = resize_and_pad_images(image, (512, 512))
-            resized_images.append(image)
-        sanity_check = torch.cat(resized_images, dim=0)
-        sanity_check = sanity_check.unsqueeze(0)
+    resized_images = list(map(lambda img: resize_and_pad_images(img, (512, 512)), sanity_check))
+    sanity_check = torch.cat(resized_images, dim=0)
+    sanity_check = sanity_check.unsqueeze(0)
         
-    else:
-        sanity_check = sanity_check.permute(0, 3, 1, 2).unsqueeze(0)#B,H,W,C to B,F,C,H,W
     sanity_check = sanity_check * 2.0 - 1.0 #normalize to the expected range (-1, 1)
     
 
@@ -109,7 +112,7 @@ def do_sanity_check(
         text = text
         save_name = f"{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'-{idx}'}.mp4"
         save_videos_grid(pixel_value, f"{output_dir}/sanity_check/{save_name}", rescale=False)
-    return(sanity_check)
+    return typing.cast(torch.Tensor, sanity_check)
 
 def sample_noise(latents, noise_strength, use_offset_noise=False):
     b, c, f, *_ = latents.shape
@@ -144,7 +147,6 @@ def create_optim_params(name='param', params=None, lr=5e-6, extra_params=None):
     return params
 
 def create_optimizer_params(model_list, lr):
-    import itertools
     optimizer_params = []
 
     for optim in model_list:
@@ -189,7 +191,7 @@ def scale_loras(lora_list: list, scale: float, step=None):
         else:
             lora_i.scale = scale
 
-def tensor_to_vae_latent(t, vae):
+def tensor_to_vae_latent(t: torch.Tensor, vae):
     video_length = t.shape[1]
     t = rearrange(t, "b f c h w -> (b f) c h w") 
     latents = vae.encode(t).latent_dist.sample()
@@ -232,14 +234,119 @@ def create_ad_temporal_loss(
 
     return loss_temporal
 
+
+@dataclass
+class _LabeledVid:
+    """
+    Single Video with prompt attached.
+    """
+    frames: torch.Tensor
+    prompt: str
+
+@dataclass
+class _VideoPipe:
+    """
+    Multiple labeled videos, together.
+    """
+    videos: list[_LabeledVid]
+
+    @classmethod
+    def empty(cls):
+        return cls([])
+    
+    def __len__(self):
+        return len(self.videos)
+    
+    def append(self, vid: _LabeledVid):
+        self.videos.append(vid)
+        return self
+
+class ADMD_Ext_InputPipeStart:
+    """
+    Start of multi-video training.
+    """
+
+    RETURN_TYPES = ("ADMDDATAPIPELINE", )
+    RETURN_NAMES = ("pipe_out", )
+    FUNCTION = "process"
+
+    CATEGORY = "AD_MotionDirector"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+    
+    def process(self):
+        return (_VideoPipe.empty(), )
+
+class ADMD_Ext_InputPipeline:
+    """
+    Allows for training of multiple videos.
+    """
+
+    RETURN_TYPES = ("ADMDDATAPIPELINE",)
+    RETURN_NAMES = ("pipe_out", )
+    FUNCTION = "process"
+
+    CATEGORY = "AD_MotionDirector"
+    # OUTPUT_NODE = True
+    @classmethod
+    def INPUT_TYPES(_):
+        return {
+            "required": {
+                "pipe": ("ADMDDATAPIPELINE", ),
+                "frames": ("IMAGE",),
+                "prompt": ("STRING", {"multiline": True, "default": "",}),
+            },
+
+        }
+    
+    def process(self, pipe: _VideoPipe, frames, prompt: str) -> tuple[_VideoPipe, ]:
+        print(f"Videos in pipe: {len(pipe) + 1}")
+        vid  = _LabeledVid(frames, prompt)
+
+        return (pipe.append(vid), )        
+
+Sched = Union[DDIMScheduler, DDPMScheduler]
+
+@dataclass
+class _Pipeline:
+    validation_pipeline: AnimationPipeline
+    train_noise_scheduler: Sched
+    train_noise_scheduler_spatial: Sched
+    unet: UNet3DConditionModel
+    vae: AutoencoderKL
+    text_encoder: CLIPTextModel
+    tokenizer: CLIPTokenizer
+
+@dataclass
+class _ADMD_Pipeline: 
+    optimizer_temporal: Union[torch.optim.AdamW, Lion]
+    lr_scheduler_temporal: torch.optim.lr_scheduler.LambdaLR
+    optimizer_spatial_list: list[Union[torch.optim.AdamW, Lion]]
+    lr_scheduler_spatial_list: list[torch.optim.lr_scheduler.LambdaLR]
+    text_prompt: list[str]
+    unet: UNet3DConditionModel
+    text_encoder: CLIPTextModel
+    vae: AutoencoderKL
+    tokenizer: CLIPTokenizer
+    pixel_values: list[torch.Tensor]
+    train_noise_scheduler: Sched
+    train_noise_scheduler_spatial: Sched
+    validation_pipeline: AnimationPipeline
+    global_step: int
+    max_train_steps: int
+    scaler: torch.amp.GradScaler
+    include_resnet: bool
+    seed: int
+        
 class ADMD_InitializeTraining:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
             "pipeline": ("PIPELINE", ),
             "lora_name": ("STRING", {"multiline": False, "default": "motiondirectorlora",}),
-            "images": ("IMAGE", ),
-            "prompt": ("STRING", {"multiline": True, "default": "",}),
+            "input_pipeline": ("ADMDDATAPIPELINE", ),
             "max_train_steps": ("INT", {"default": 300, "min": 0, "max": 100000, "step": 1}),
             "learning_rate": ("FLOAT", {"default": 5e-4, "min": 0, "max": 10000, "step": 0.00001}),
             "learning_rate_spatial": ("FLOAT", {"default": 1e-4, "min": 0, "max": 10000, "step": 0.00001}),    
@@ -264,25 +371,26 @@ class ADMD_InitializeTraining:
 
     CATEGORY = "AD_MotionDirector"
 
-    def process(self, pipeline, images, prompt,  
+    def process(self, pipeline: _Pipeline, input_pipeline: _VideoPipe,  
                 lora_name, learning_rate, learning_rate_spatial, 
                 lora_rank, seed, optimization_method, max_train_steps, include_resnet):
         with torch.inference_mode(False):
                       
-            validation_pipeline = pipeline["validation_pipeline"]
-            train_noise_scheduler = pipeline["train_noise_scheduler"]
-            train_noise_scheduler_spatial = pipeline["train_noise_scheduler_spatial"]
+            validation_pipeline = pipeline.validation_pipeline
+            train_noise_scheduler = pipeline.train_noise_scheduler
+            train_noise_scheduler_spatial = pipeline.train_noise_scheduler_spatial
 
-            unet = pipeline["unet"]
-            text_encoder = pipeline["text_encoder"]
-            vae = pipeline["vae"]
-            tokenizer = pipeline["tokenizer"]
+            unet = pipeline.unet
+            text_encoder = pipeline.text_encoder
+            vae = pipeline.vae
+            tokenizer = pipeline.tokenizer
 
             torch.manual_seed(seed)
 
-            text_prompt = []
-            text_prompt.append(prompt)
-  
+            videos, text_prompt = [list(v) for v in zip(*map(lambda v: (v.frames, v.prompt), input_pipeline.videos))]
+            text_prompt = typing.cast(list[str], text_prompt)
+            videos = typing.cast(list[torch.Tensor], videos)
+
             scale_lr = False
             lr_warmup_steps = 0
             lr_scheduler = "constant"
@@ -411,30 +519,30 @@ class ADMD_InitializeTraining:
                 scaler.reset()
                 print("reset scaler")
 
-        admd_pipeline = {
-            "optimizer_temporal": optimizer_temporal,
-            "optimizer_spatial_list": optimizer_spatial_list,
-            "lr_scheduler_spatial_list": lr_scheduler_spatial_list,
-            "lr_scheduler_temporal": lr_scheduler_temporal,
-            "text_prompt": text_prompt,
-            "unet": unet,
-            "text_encoder": text_encoder,
-            "vae": vae,
-            "tokenizer": tokenizer,
-            "pixel_values": images,
-            "train_noise_scheduler": train_noise_scheduler,
-            "train_noise_scheduler_spatial": train_noise_scheduler_spatial,
-            "validation_pipeline": validation_pipeline,
-            "global_step": 0,
-            "max_train_steps": max_train_steps,
-            "scaler": scaler,
-            "include_resnet": include_resnet,
-            "seed": seed
-        }
+        admd_pipeline = _ADMD_Pipeline(
+            optimizer_temporal=optimizer_temporal,
+            optimizer_spatial_list=optimizer_spatial_list,
+            lr_scheduler_spatial_list=lr_scheduler_spatial_list,
+            lr_scheduler_temporal=lr_scheduler_temporal,
+            text_prompt=text_prompt,
+            unet=unet,
+            text_encoder=text_encoder,
+            vae=vae,
+            tokenizer=tokenizer,
+            pixel_values=videos,
+            train_noise_scheduler=train_noise_scheduler,
+            train_noise_scheduler_spatial=train_noise_scheduler_spatial,
+            validation_pipeline=validation_pipeline,
+            global_step=0,
+            max_train_steps=max_train_steps,
+            scaler=scaler,
+            include_resnet=include_resnet,
+            seed=seed
+        )
+
         #Data batch sanity check
-        
         sanitycheck = do_sanity_check(
-                images,  
+                videos,  
                 output_dir=output_dir, 
                 text_prompt=text_prompt
         )
@@ -569,15 +677,16 @@ class ADMD_DiffusersLoader:
 
             validation_pipeline.enable_vae_slicing()         
 
-            pipeline = {
-                'validation_pipeline': validation_pipeline,
-                'train_noise_scheduler': train_noise_scheduler,
-                'train_noise_scheduler_spatial': train_noise_scheduler_spatial,
-                'unet': unet,
-                'vae': vae,
-                'text_encoder': text_encoder,
-                'tokenizer': tokenizer
-            }
+
+            pipeline = _Pipeline(
+                validation_pipeline=validation_pipeline,
+                train_noise_scheduler=train_noise_scheduler,
+                train_noise_scheduler_spatial=train_noise_scheduler_spatial,
+                unet=unet,
+                vae=vae,
+                text_encoder=text_encoder,
+                tokenizer=tokenizer
+            )
 
             return (pipeline,)
 
@@ -698,15 +807,15 @@ class ADMD_CheckpointLoader:
 
             validation_pipeline.enable_vae_slicing()         
 
-            pipeline = {
-                'validation_pipeline': validation_pipeline,
-                'train_noise_scheduler': train_noise_scheduler,
-                'train_noise_scheduler_spatial': train_noise_scheduler_spatial,
-                'unet': unet,
-                'vae': vae,
-                'text_encoder': text_encoder,
-                'tokenizer': tokenizer
-            }
+            pipeline = _Pipeline(
+                validation_pipeline=validation_pipeline,
+                train_noise_scheduler=train_noise_scheduler,
+                train_noise_scheduler_spatial=train_noise_scheduler_spatial,
+                unet=unet,
+                vae=vae,
+                text_encoder=text_encoder,
+                tokenizer=tokenizer
+            )
 
             return (pipeline,)
         
@@ -830,15 +939,16 @@ class ADMD_ComfyModelLoader:
             pbar.update(1)
             validation_pipeline.enable_vae_slicing()         
 
-            pipeline = {
-                'validation_pipeline': validation_pipeline,
-                'train_noise_scheduler': train_noise_scheduler,
-                'train_noise_scheduler_spatial': train_noise_scheduler_spatial,
-                'unet': unet,
-                'vae': vae,
-                'text_encoder': text_encoder,
-                'tokenizer': tokenizer
-            }
+
+            pipeline = _Pipeline(
+                validation_pipeline=validation_pipeline,
+                train_noise_scheduler=train_noise_scheduler,
+                train_noise_scheduler_spatial=train_noise_scheduler_spatial,
+                unet=unet,
+                vae=vae,
+                text_encoder=text_encoder,
+                tokenizer=tokenizer
+            )
 
             return (pipeline,)
         
@@ -959,10 +1069,10 @@ class ADMD_SaveLora:
     CATEGORY = "AD_MotionDirector"
     FUNCTION = "save_motion_lora"
 
-    def save_motion_lora(self, admd_pipeline, lora_info):
+    def save_motion_lora(self, admd_pipeline: _ADMD_Pipeline, lora_info):
         with torch.inference_mode(False):
-            validation_pipeline = admd_pipeline['validation_pipeline']
-            global_step = admd_pipeline['global_step']
+            validation_pipeline = admd_pipeline.validation_pipeline
+            global_step = admd_pipeline.global_step
 
             import copy
             validation_pipeline.to('cpu')  # We do this to prevent VRAM spiking / increase from the new copy
@@ -977,7 +1087,7 @@ class ADMD_SaveLora:
             lora_manager_spatial.save_lora_weights(
                 model=copy.deepcopy(validation_pipeline), 
                 save_path=spatial_lora_path, 
-                step=global_step,
+                step=str(global_step),
                 use_safetensors=True,
                 lora_rank=lora_rank,
                 lora_name=lora_name + "_r"+ str(lora_rank) + "_spatial",
@@ -987,7 +1097,7 @@ class ADMD_SaveLora:
                 lora_manager_temporal.save_lora_weights(
                     model=copy.deepcopy(validation_pipeline), 
                     save_path=temporal_lora_path, 
-                    step=global_step,
+                    step=str(global_step),
                     use_safetensors=True,
                     lora_rank=lora_rank,
                     lora_name=lora_name + "_r"+ str(lora_rank) + "_temporal",
@@ -1018,23 +1128,23 @@ class ADMD_TrainLora:
     CATEGORY = "AD_MotionDirector"
     FUNCTION = "train"
 
-    def train(self, admd_pipeline, steps, opt_images_override=None, trigger_input=None):
+    def train(self, admd_pipeline: _ADMD_Pipeline, steps, opt_images_override=None, trigger_input=None):
         with torch.inference_mode(False):
-            train_noise_scheduler = admd_pipeline["train_noise_scheduler"]
-            train_noise_scheduler_spatial = admd_pipeline["train_noise_scheduler_spatial"]
+            train_noise_scheduler = admd_pipeline.train_noise_scheduler
+            train_noise_scheduler_spatial = admd_pipeline.train_noise_scheduler_spatial
             
-            text_encoder = admd_pipeline["text_encoder"]
-            tokenizer = admd_pipeline["tokenizer"]
+            text_encoder = admd_pipeline.text_encoder
+            tokenizer = admd_pipeline.tokenizer
             
-            optimizer_temporal = admd_pipeline["optimizer_temporal"]
-            optimizer_spatial_list = admd_pipeline["optimizer_spatial_list"]
-            lr_scheduler_spatial_list = admd_pipeline["lr_scheduler_spatial_list"]
-            lr_scheduler_temporal = admd_pipeline["lr_scheduler_temporal"]
-            text_prompt = admd_pipeline["text_prompt"]
-            pixel_values = admd_pipeline["pixel_values"]
-            scaler = admd_pipeline["scaler"]
-            seed = admd_pipeline["seed"]
-            include_resnet = admd_pipeline["include_resnet"]
+            optimizer_temporal = admd_pipeline.optimizer_temporal
+            optimizer_spatial_list = admd_pipeline.optimizer_spatial_list
+            lr_scheduler_spatial_list = admd_pipeline.lr_scheduler_spatial_list
+            lr_scheduler_temporal = admd_pipeline.lr_scheduler_temporal
+            text_prompt = admd_pipeline.text_prompt
+            pixel_values = admd_pipeline.pixel_values
+            scaler = admd_pipeline.scaler
+            seed = admd_pipeline.seed
+            include_resnet = admd_pipeline.include_resnet
             use_offset_noise = False
 
             torch.manual_seed(seed)
@@ -1042,8 +1152,8 @@ class ADMD_TrainLora:
             device = comfy.model_management.get_torch_device()
             comfy.model_management.unload_all_models()
 
-            unet = admd_pipeline["unet"]
-            vae = admd_pipeline["vae"]
+            unet = admd_pipeline.unet
+            vae = admd_pipeline.vae
 
             unet.to(device)
             vae.to(device)
@@ -1060,52 +1170,43 @@ class ADMD_TrainLora:
       
             first_epoch = 0
             gradient_accumulation_steps = 1
-            global_step = admd_pipeline["global_step"]
+            global_step = admd_pipeline.global_step
             print(f"global_step: {global_step}")
             
             
             # Get the text embedding for conditioning
             with torch.no_grad():
-                prompt_ids = tokenizer(
-                    text_prompt, 
+                prompt_ids = [tokenizer(
+                    [txt], 
                     max_length=tokenizer.model_max_length, 
                     padding="max_length", 
                     truncation=True, 
                     return_tensors="pt"
-                ).input_ids.to(device)
+                ).input_ids.to(device) for txt in text_prompt]
 
                 #text encoding
                 text_encoder.to(device)
-                encoder_hidden_states = text_encoder(prompt_ids)[0]
+                import transformers.modeling_outputs
+                encoder_hidden_states_list = [text_encoder(prompt_id)[0] for prompt_id in prompt_ids]
+                print("ENCODER STATES LIST: ", encoder_hidden_states_list)
                 text_encoder.to('cpu')
-
-                pixel_list = []
-                latent_list = []
 
                 if opt_images_override is not None:
                     pixel_values = opt_images_override
 
-                if isinstance(pixel_values, list):
-                    print(f"Received {len(pixel_values)} batches:")
-                    for p in pixel_values:
-                        print("input batch shape:", p.shape)
-                        p = p * 2.0 - 1.0 #normalize to the expected range (-1, 1)
-                        p = p.permute(0, 3, 1, 2).unsqueeze(0)#B,H,W,C to B,F,C,H,W
-                        p = p.to(device)
-                        pixel_list.append(p)
-                        latent_list.append(tensor_to_vae_latent(p, vae))
-                        batch_size = len(pixel_list)
-                else:
-                    print("Received a single batch")
-                    print("input batch shape:", pixel_values.shape)
-                    pixel_values = pixel_values * 2.0 - 1.0 #normalize to the expected range (-1, 1)
-                    pixel_values = pixel_values.permute(0, 3, 1, 2).unsqueeze(0)#B,H,W,C to B,F,C,H,W
-                    pixel_values = pixel_values.to(device)
-                    latents = tensor_to_vae_latent(pixel_values, vae)
-                    pixel_list.append(pixel_values)
-                    latent_list.append(latents)
-                    batch_size = 1
+                def to_latent(px: torch.Tensor):
+                    print("input batch shape:", px.shape)
+                    px = px * 2.0 - 1.0 #normalize to the expected range (-1, 1)
+                    px = px.permute(0, 3, 1, 2).unsqueeze(0)#B,H,W,C to B,F,C,H,W
+                    px = px.to(device)
+                    latents = tensor_to_vae_latent(px, vae)
+                    return (px, latents)
 
+                print(f"Received {len(pixel_values)} batche(s):")
+                pixel_list, latent_list = [list(s) for s in zip(*map(to_latent, pixel_values))]
+                pixel_list = typing.cast(torch.Tensor, pixel_list)
+                
+                batch_size = len(pixel_list)
                 
                 print("batch_size:", batch_size)
                 vae.to('cpu')
@@ -1117,14 +1218,17 @@ class ADMD_TrainLora:
                 progress_bar.set_description("Steps")
                 pbar = comfy.utils.ProgressBar(steps)
 
-            import itertools
             pixel_cycle = itertools.cycle(pixel_list)
             latent_cycle = itertools.cycle(latent_list)
+            encoder_hidden_states_cycle = itertools.cycle(encoder_hidden_states_list)
             ### <<<< Training <<<< ###
             #for epoch in range(first_epoch, steps):
             for step in range(steps):
                 pixel_values = next(pixel_cycle)
                 latents = next(latent_cycle)
+                encoder_hidden_states = next(encoder_hidden_states_cycle)
+                # encoder_hidden_states = next(encoder_hidden_states_cycle)
+                
                 spatial_scheduler_lr = 0.0
                 temporal_scheduler_lr = 0.0
 
@@ -1215,14 +1319,12 @@ class ADMD_TrainLora:
                 #     print("BREAK")
                 #     break
 
-            admd_pipeline.update({
-                "global_step": global_step,
-                "unet": unet,
-                "scaler": scaler,
-            })
+            admd_pipeline.global_step = global_step
+            admd_pipeline.unet = unet
+            admd_pipeline.scaler = scaler
+
             comfy.model_management.soft_empty_cache()
             return (admd_pipeline,)
-
 
 class ADMD_ValidationSampler:
 
@@ -1232,6 +1334,9 @@ class ADMD_ValidationSampler:
             "required": {
                 "validation_settings": ("VALIDATION_SETTINGS", ),
                 "admd_pipeline": ("ADMDPIPELINE", ),
+                "width": ("INT", { "default": 512, "min": 0,"step": 8 }),
+                "height": ("INT", { "default": 512, "min": 0,"step": 8 }),
+                "frames": ("INT", { "default": 16, "min": 0,"step": 1 }),
             },
         }
     
@@ -1240,21 +1345,18 @@ class ADMD_ValidationSampler:
     CATEGORY = "AD_MotionDirector"
     FUNCTION = "train"
 
-    def train(self, admd_pipeline, validation_settings):
+    def train(self, admd_pipeline: _ADMD_Pipeline, validation_settings, width: int, height: int, frames: int):
         with torch.inference_mode(False):       
-            unet = admd_pipeline["unet"]
-            text_encoder = admd_pipeline["text_encoder"]
-            vae = admd_pipeline["vae"]           
-            text_prompt = admd_pipeline["text_prompt"]
-            pixel_values = admd_pipeline["pixel_values"]
+            unet = admd_pipeline.unet
+            text_encoder = admd_pipeline.text_encoder
+            vae = admd_pipeline.vae
+            text_prompt = admd_pipeline.text_prompt
+            pixel_values = admd_pipeline.pixel_values
             
-            validation_pipeline = admd_pipeline['validation_pipeline']
+            validation_pipeline = admd_pipeline.validation_pipeline
           
             device = comfy.model_management.get_torch_device()
-            if isinstance(pixel_values, list):
-                B, H, W, C = pixel_values[0].shape
-            else:
-                B, H, W, C = pixel_values.shape
+            # B, H, W, C = pixel_values[0].shape
 
             unet.to(device)
             vae.to(device)
@@ -1289,9 +1391,9 @@ class ADMD_ValidationSampler:
                         sample = validation_pipeline(
                             prompt,
                             generator    = generator,
-                            video_length = B,
-                            height       = H,
-                            width        = W,
+                            video_length = frames,
+                            height       = height,
+                            width        = width,
                             num_inference_steps = validation_inference_steps,
                             guidance_scale = validation_guidance_scale,
                         ).videos
@@ -1344,7 +1446,9 @@ NODE_CLASS_MAPPINGS = {
     "ADMD_CheckpointLoader": ADMD_CheckpointLoader,
     "ADMD_ValidationSampler": ADMD_ValidationSampler,
     "ADMD_MakeBatchList": ADMD_MakeBatchList,
-    "ADMD_ComfyModelLoader": ADMD_ComfyModelLoader
+    "ADMD_ComfyModelLoader": ADMD_ComfyModelLoader,
+    "ADMD_Ext_InputPipeline": ADMD_Ext_InputPipeline,
+    "ADMD_Ext_InputPipeStart": ADMD_Ext_InputPipeStart,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ADMD_InitializeTraining": "ADMD_InitializeTraining",
@@ -1357,5 +1461,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ADMD_CheckpointLoader": "ADMD_CheckpointLoader",
     "ADMD_ValidationSampler": "ADMD_ValidationSampler",
     "ADMD_MakeBatchList": "ADMD_MakeBatchList",
-    "ADMD_ComfyModelLoader": "ADMD_ComfyModelLoader"
+    "ADMD_ComfyModelLoader": "ADMD_ComfyModelLoader",
+    "ADMD_Ext_InputPipeline": "ADMD_Ext_InputPipeline",
+    "ADMD_Ext_InputPipeStart": "ADMD_Ext_InputPipeStart",
 }
