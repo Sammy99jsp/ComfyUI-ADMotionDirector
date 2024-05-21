@@ -1,5 +1,4 @@
 import os
-import math
 import random
 import logging
 import datetime
@@ -14,19 +13,19 @@ from omegaconf import OmegaConf
 import torch
 import torch.nn.functional as F
 
-from diffusers import AutoencoderKL, DDIMScheduler, DDPMScheduler
+from diffusers import AutoencoderKL, DDIMScheduler, DDPMScheduler # type: ignore
 from diffusers.optimization import get_scheduler
 
 from transformers import CLIPTextModel, CLIPTokenizer
 from dataclasses import dataclass
-
-import transformers.modeling_outputs
 
 from .animatediff.models.unet import UNet3DConditionModel
 from .animatediff.pipelines.pipeline_animation import AnimationPipeline
 from .animatediff.utils.util import save_videos_grid, load_weights
 from .animatediff.utils.lora_handler import LoraHandler
 from .animatediff.utils.lora import extract_lora_child_module
+
+from . import utils
 
 from .motion_lora import MotionLoraInfo, MotionLoraList
 
@@ -36,15 +35,15 @@ import comfy.utils
 import folder_paths
 
 try:
-    import xformers
-    import xformers.ops
+    import xformers # type: ignore
+    import xformers.ops # type: ignore
 
     XFORMERS_IS_AVAILABLE = True
 except:
     XFORMERS_IS_AVAILABLE = False
 
 import typing
-from typing import Union
+from typing import Any, Generic, Iterable, Iterator, TypeVar, Union
 import torch.amp
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
@@ -95,17 +94,17 @@ def resize_and_pad_images(images, output_size):
 
 def do_sanity_check(
     sanity_check: list[torch.Tensor],  
-    output_dir,
-    text_prompt
+    output_dir: str,
+    text_prompt: list[str],
 ):
     resized_images = list(map(lambda img: resize_and_pad_images(img, (512, 512)), sanity_check))
-    sanity_check = torch.cat(resized_images, dim=0)
-    sanity_check = sanity_check.unsqueeze(0)
+    sanity_check = torch.cat(resized_images, dim=0) # type: ignore
+    sanity_check = sanity_check.unsqueeze(0) # type: ignore
         
-    sanity_check = sanity_check * 2.0 - 1.0 #normalize to the expected range (-1, 1)
+    sanity_check = sanity_check * 2.0 - 1.0 #normalize to the expected range (-1, 1) # type: ignore
     
 
-    sanity_check, texts = sanity_check.cpu(), text_prompt  
+    sanity_check, texts = sanity_check.cpu(), text_prompt  # type: ignore
     sanity_check = rearrange(sanity_check, "b f c h w -> b c f h w")
     for idx, (pixel_value, text) in enumerate(zip(sanity_check, texts)):
         pixel_value = pixel_value[None, ...]
@@ -125,7 +124,7 @@ def sample_noise(latents, noise_strength, use_offset_noise=False):
     return noise_latents
 
 def param_optim(model, condition, extra_params=None, is_lora=False, negation=None):
-    extra_params = extra_params if len(extra_params.keys()) > 0 else None
+    extra_params = extra_params if len(extra_params.keys()) > 0 else None # type: ignore
     return {
         "model": model,
         "condition": condition,
@@ -169,7 +168,7 @@ def create_optimizer_params(model_list, lr):
 
         # If this is true, we can train it.
         if condition:
-            for n, p in model.named_parameters():
+            for n, p in model.named_parameters(): # type: ignore
                 should_negate = 'lora' in n and not is_lora
                 if should_negate: continue
             
@@ -189,16 +188,8 @@ def scale_loras(lora_list: list, scale: float, step=None):
         if step is not None:
             lora_list[lora_i].scale = scale
         else:
-            lora_i.scale = scale
+            lora_i.scale = scale # type: ignore
 
-def tensor_to_vae_latent(t: torch.Tensor, vae):
-    video_length = t.shape[1]
-    t = rearrange(t, "b f c h w -> (b f) c h w") 
-    latents = vae.encode(t).latent_dist.sample()
-    latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
-    latents = latents * 0.18215
-
-    return latents
 
 def get_spatial_latents(
         pixel_values: torch.Tensor, 
@@ -210,8 +201,8 @@ def get_spatial_latents(
     noisy_latents_input = None
     target_spatial = None
     
-    noisy_latents_input = noisy_latents[:, :, ran_idx, :, :]
-    target_spatial = target[:, :, ran_idx, :, :]
+    noisy_latents_input = noisy_latents[:, :, ran_idx, :, :] # type: ignore
+    target_spatial = target[:, :, ran_idx, :, :] # type: ignore
 
     return noisy_latents_input, target_spatial
 
@@ -226,8 +217,8 @@ def create_ad_temporal_loss(
 
     ran_idx = torch.randint(0, model_pred.shape[2], (1,)).item()
 
-    model_pred_decent = alpha * model_pred - beta * model_pred[:, :, ran_idx, :, :].unsqueeze(2)
-    target_decent = alpha * target - beta * target[:, :, ran_idx, :, :].unsqueeze(2)
+    model_pred_decent = alpha * model_pred - beta * model_pred[:, :, ran_idx, :, :].unsqueeze(2) # type: ignore
+    target_decent = alpha * target - beta * target[:, :, ran_idx, :, :].unsqueeze(2) # type: ignore
 
     loss_ad_temporal = F.mse_loss(model_pred_decent.float(), target_decent.float(), reduction="mean")
     loss_temporal = loss_temporal + loss_ad_temporal
@@ -235,31 +226,6 @@ def create_ad_temporal_loss(
     return loss_temporal
 
 
-@dataclass
-class _LabeledVid:
-    """
-    Single Video with prompt attached.
-    """
-    frames: torch.Tensor
-    prompt: str
-
-@dataclass
-class _VideoPipe:
-    """
-    Multiple labeled videos, together.
-    """
-    videos: list[_LabeledVid]
-
-    @classmethod
-    def empty(cls):
-        return cls([])
-    
-    def __len__(self):
-        return len(self.videos)
-    
-    def append(self, vid: _LabeledVid):
-        self.videos.append(vid)
-        return self
 
 class ADMD_Ext_InputPipeStart:
     """
@@ -274,10 +240,12 @@ class ADMD_Ext_InputPipeStart:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {}}
+        return {"required": {
+            "input_scheduler": (list(utils.scheduling.INPUT_SCHEDULERS.keys()), {"default": "round-robin"})
+        }}
     
-    def process(self):
-        return (_VideoPipe.empty(), )
+    def process(self, input_scheduler: str):
+        return (utils.VideoPipe.empty(utils.scheduling.INPUT_SCHEDULERS[input_scheduler]),)
 
 class ADMD_Ext_InputPipeline:
     """
@@ -291,7 +259,7 @@ class ADMD_Ext_InputPipeline:
     CATEGORY = "AD_MotionDirector"
     # OUTPUT_NODE = True
     @classmethod
-    def INPUT_TYPES(_):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "pipe": ("ADMDDATAPIPELINE", ),
@@ -301,9 +269,9 @@ class ADMD_Ext_InputPipeline:
 
         }
     
-    def process(self, pipe: _VideoPipe, frames, prompt: str) -> tuple[_VideoPipe, ]:
+    def process(self, pipe: utils.VideoPipe, frames, prompt: str) -> tuple[utils.VideoPipe, ]:
         print(f"Videos in pipe: {len(pipe) + 1}")
-        vid  = _LabeledVid(frames, prompt)
+        vid  = utils.inputs.LabeledVid(frames, prompt)
 
         return (pipe.append(vid), )        
 
@@ -325,24 +293,25 @@ class _ADMD_Pipeline:
     lr_scheduler_temporal: torch.optim.lr_scheduler.LambdaLR
     optimizer_spatial_list: list[Union[torch.optim.AdamW, Lion]]
     lr_scheduler_spatial_list: list[torch.optim.lr_scheduler.LambdaLR]
-    text_prompt: list[str]
     unet: UNet3DConditionModel
     text_encoder: CLIPTextModel
     vae: AutoencoderKL
     tokenizer: CLIPTokenizer
-    pixel_values: list[torch.Tensor]
+
+    inputs: utils.scheduling.InputSchedule[Any, utils.inputs.LabeledVid]
+
     train_noise_scheduler: Sched
     train_noise_scheduler_spatial: Sched
     validation_pipeline: AnimationPipeline
     global_step: int
     max_train_steps: int
-    scaler: torch.amp.GradScaler
+    scaler: torch.amp.GradScaler # type: ignore
     include_resnet: bool
     seed: int
-        
+
 class ADMD_InitializeTraining:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {"required": {
             "pipeline": ("PIPELINE", ),
             "lora_name": ("STRING", {"multiline": False, "default": "motiondirectorlora",}),
@@ -371,7 +340,7 @@ class ADMD_InitializeTraining:
 
     CATEGORY = "AD_MotionDirector"
 
-    def process(self, pipeline: _Pipeline, input_pipeline: _VideoPipe,  
+    def process(self, pipeline: _Pipeline, input_pipeline: utils.VideoPipe,  
                 lora_name, learning_rate, learning_rate_spatial, 
                 lora_rank, seed, optimization_method, max_train_steps, include_resnet):
         with torch.inference_mode(False):
@@ -387,9 +356,10 @@ class ADMD_InitializeTraining:
 
             torch.manual_seed(seed)
 
-            videos, text_prompt = [list(v) for v in zip(*map(lambda v: (v.frames, v.prompt), input_pipeline.videos))]
-            text_prompt = typing.cast(list[str], text_prompt)
-            videos = typing.cast(list[torch.Tensor], videos)
+
+            print("INPUT SCHEDULER: ", input_pipeline.input_scheduler)
+            input_schedule = utils.scheduling.InputSchedule(input_pipeline.input_scheduler, input_pipeline.videos)
+
 
             scale_lr = False
             lr_warmup_steps = 0
@@ -516,7 +486,7 @@ class ADMD_InitializeTraining:
                 scaler = torch.cuda.amp.GradScaler()
                 print("initialize scaler")
             else:
-                scaler.reset()
+                scaler.reset() # type: ignore
                 print("reset scaler")
 
         admd_pipeline = _ADMD_Pipeline(
@@ -524,12 +494,11 @@ class ADMD_InitializeTraining:
             optimizer_spatial_list=optimizer_spatial_list,
             lr_scheduler_spatial_list=lr_scheduler_spatial_list,
             lr_scheduler_temporal=lr_scheduler_temporal,
-            text_prompt=text_prompt,
             unet=unet,
             text_encoder=text_encoder,
             vae=vae,
+            inputs=input_schedule,
             tokenizer=tokenizer,
-            pixel_values=videos,
             train_noise_scheduler=train_noise_scheduler,
             train_noise_scheduler_spatial=train_noise_scheduler_spatial,
             validation_pipeline=validation_pipeline,
@@ -542,9 +511,9 @@ class ADMD_InitializeTraining:
 
         #Data batch sanity check
         sanitycheck = do_sanity_check(
-                videos,  
+                sanity_check=list(map(lambda vid: vid.frames, input_schedule.items)),  
                 output_dir=output_dir, 
-                text_prompt=text_prompt
+                text_prompt=list(map(lambda vid: vid.prompt, input_schedule.items))
         )
  
         sanitycheck = sanitycheck.view(*sanitycheck.shape[1:])
@@ -554,7 +523,7 @@ class ADMD_InitializeTraining:
 
 class ADMD_DiffusersLoader:
     @classmethod
-    def IS_CHANGED(s):
+    def IS_CHANGED(cls):
         return ""
     @classmethod
     def INPUT_TYPES(cls):
@@ -648,8 +617,8 @@ class ADMD_DiffusersLoader:
             
             # Freeze all models for LoRA training
             unet.requires_grad_(False)
-            vae.requires_grad_(False)
-            text_encoder.requires_grad_(False)
+            vae.requires_grad_(False) # type: ignore
+            text_encoder.requires_grad_(False) # type: ignore
 
             #xformers
             if XFORMERS_IS_AVAILABLE:
@@ -663,7 +632,11 @@ class ADMD_DiffusersLoader:
 
             # Validation pipeline
             validation_pipeline = AnimationPipeline(
-                unet=unet, vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, scheduler=noise_scheduler,
+                unet=unet, 
+                vae=vae,                    # type: ignore
+                tokenizer=tokenizer, 
+                text_encoder=text_encoder,  # type: ignore
+                scheduler=noise_scheduler,  # type: ignore
             ).to(device)
 
             motion_model, domain_adapter_path = additional_models 
@@ -683,8 +656,8 @@ class ADMD_DiffusersLoader:
                 train_noise_scheduler=train_noise_scheduler,
                 train_noise_scheduler_spatial=train_noise_scheduler_spatial,
                 unet=unet,
-                vae=vae,
-                text_encoder=text_encoder,
+                vae=vae,                            # type: ignore
+                text_encoder=text_encoder,          # type: ignore
                 tokenizer=tokenizer
             )
 
@@ -692,7 +665,7 @@ class ADMD_DiffusersLoader:
 
 class ADMD_CheckpointLoader:
     @classmethod
-    def IS_CHANGED(s):
+    def IS_CHANGED(cls):
         return ""
     @classmethod
     def INPUT_TYPES(cls):
@@ -726,13 +699,13 @@ class ADMD_CheckpointLoader:
             from diffusers.loaders.single_file_utils import (convert_ldm_vae_checkpoint, convert_ldm_unet_checkpoint, create_text_encoder_from_ldm_clip_checkpoint, create_vae_diffusers_config, create_unet_diffusers_config)
             from safetensors import safe_open
 
-            if model_path.endswith(".safetensors"):
+            if model_path.endswith(".safetensors"):                                 # type: ignore
                 dreambooth_state_dict = {}
-                with safe_open(model_path, framework="pt", device="cpu") as f:
+                with safe_open(model_path, framework="pt", device="cpu") as f:      # type: ignore
                     for key in f.keys():
                         dreambooth_state_dict[key] = f.get_tensor(key)
-            elif model_path.endswith(".ckpt"):
-                dreambooth_state_dict = torch.load(model_path, map_location="cpu")
+            elif model_path.endswith(".ckpt"):                                      # type: ignore
+                dreambooth_state_dict = torch.load(model_path, map_location="cpu")  # type: ignore
                 while "state_dict" in dreambooth_state_dict:
                     dreambooth_state_dict = dreambooth_state_dict["state_dict"]
 
@@ -772,14 +745,18 @@ class ADMD_CheckpointLoader:
             # 2. unet
             converted_unet_config = create_unet_diffusers_config(original_config, image_size=512)
             converted_unet = convert_ldm_unet_checkpoint(dreambooth_state_dict, converted_unet_config)
-            unet = UNet3DConditionModel(**ad_unet_config)
+            unet = UNet3DConditionModel(**ad_unet_config)       # type: ignore
             unet.load_state_dict(converted_unet, strict=False)
 
             del dreambooth_state_dict, converted_unet, converted_vae
 
             # Validation pipeline
             validation_pipeline = AnimationPipeline(
-                unet=unet, vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, scheduler=noise_scheduler,
+                unet=unet, 
+                vae=vae, 
+                tokenizer=tokenizer, 
+                text_encoder=text_encoder, 
+                scheduler=noise_scheduler,      # type: ignore
             )
             # Freeze all models for LoRA training
             unet.requires_grad_(False)
@@ -821,7 +798,7 @@ class ADMD_CheckpointLoader:
         
 class ADMD_ComfyModelLoader:
     @classmethod
-    def IS_CHANGED(s):
+    def IS_CHANGED(cls):
         return ""
     @classmethod
     def INPUT_TYPES(cls):
@@ -902,7 +879,7 @@ class ADMD_ComfyModelLoader:
             # 2. unet
             converted_unet_config = create_unet_diffusers_config(original_config, image_size=512)
             converted_unet = convert_ldm_unet_checkpoint(sd, converted_unet_config)
-            unet = UNet3DConditionModel(**ad_unet_config)
+            unet = UNet3DConditionModel(**ad_unet_config)       # type: ignore
             unet.load_state_dict(converted_unet, strict=False)
             
             del sd, converted_unet, converted_vae
@@ -911,7 +888,11 @@ class ADMD_ComfyModelLoader:
 
             # Validation pipeline
             validation_pipeline = AnimationPipeline(
-                unet=unet, vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, scheduler=noise_scheduler,
+                unet=unet, 
+                vae=vae, 
+                tokenizer=tokenizer, 
+                text_encoder=text_encoder,
+                scheduler=noise_scheduler, # type: ignore
             )
             # Freeze all models for LoRA training
             unet.requires_grad_(False)
@@ -954,7 +935,7 @@ class ADMD_ComfyModelLoader:
         
 class ADMD_AdditionalModelSelect:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": { 
                 "motion_module": (folder_paths.get_filename_list("animatediff_models"),),
@@ -973,11 +954,11 @@ class ADMD_AdditionalModelSelect:
     def select_models(self, motion_module, use_adapter_lora, optional_adapter_lora=""):
         additional_models = []
         motion_model = folder_paths.get_full_path("animatediff_models", motion_module)
-        if not Path(motion_model).is_file():
+        if not Path(motion_model).is_file():                # type: ignore
             raise ValueError(f"Motion model {motion_model} does not exist")
         if use_adapter_lora:
             adapter_lora_path = folder_paths.get_full_path("loras", optional_adapter_lora)
-            if not Path(adapter_lora_path).is_file():
+            if not Path(adapter_lora_path).is_file():       # type: ignore
                 raise ValueError(f"Adapter LoRA path {adapter_lora_path} does not exist")
         else:
             adapter_lora_path = ""        
@@ -988,7 +969,7 @@ class ADMD_AdditionalModelSelect:
 
 class ADMD_ValidationSettings:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
         "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
@@ -1022,7 +1003,7 @@ class ADMD_ValidationSettings:
 
 class ADMD_LoadLora:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "lora_path": ("STRING", {"forceInput": True, "multiline": False, "default": "",}),
@@ -1037,7 +1018,7 @@ class ADMD_LoadLora:
     CATEGORY = "AD_MotionDirector"
     FUNCTION = "load_motion_lora"
 
-    def load_motion_lora(self, lora_path: str, strength: float, prev_motion_lora: MotionLoraList=None):
+    def load_motion_lora(self, lora_path: str, strength: float, prev_motion_lora: Union[MotionLoraList, None]=None):
         
         if prev_motion_lora is None:
             prev_motion_lora = MotionLoraList()
@@ -1056,7 +1037,7 @@ class ADMD_LoadLora:
 class ADMD_SaveLora:
 
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "admd_pipeline": ("ADMDPIPELINE", ),
@@ -1085,7 +1066,7 @@ class ADMD_SaveLora:
 
             lora_manager_spatial = LoraHandler(use_unet_lora=True, unet_replace_modules=["Transformer3DModel"])
             lora_manager_spatial.save_lora_weights(
-                model=copy.deepcopy(validation_pipeline), 
+                model=copy.deepcopy(validation_pipeline),       # type: ignore
                 save_path=spatial_lora_path, 
                 step=str(global_step),
                 use_safetensors=True,
@@ -1095,7 +1076,7 @@ class ADMD_SaveLora:
             lora_manager_temporal = LoraHandler(use_unet_lora=True, unet_replace_modules=["TemporalTransformerBlock"])
             if lora_manager_temporal is not None:
                 lora_manager_temporal.save_lora_weights(
-                    model=copy.deepcopy(validation_pipeline), 
+                    model=copy.deepcopy(validation_pipeline),   # type: ignore
                     save_path=temporal_lora_path, 
                     step=str(global_step),
                     use_safetensors=True,
@@ -1111,7 +1092,7 @@ class ADMD_SaveLora:
 class ADMD_TrainLora:
 
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": { 
                 "admd_pipeline": ("ADMDPIPELINE", ),
@@ -1135,13 +1116,13 @@ class ADMD_TrainLora:
             
             text_encoder = admd_pipeline.text_encoder
             tokenizer = admd_pipeline.tokenizer
+
+            input_sched = admd_pipeline.inputs
             
             optimizer_temporal = admd_pipeline.optimizer_temporal
             optimizer_spatial_list = admd_pipeline.optimizer_spatial_list
             lr_scheduler_spatial_list = admd_pipeline.lr_scheduler_spatial_list
             lr_scheduler_temporal = admd_pipeline.lr_scheduler_temporal
-            text_prompt = admd_pipeline.text_prompt
-            pixel_values = admd_pipeline.pixel_values
             scaler = admd_pipeline.scaler
             seed = admd_pipeline.seed
             include_resnet = admd_pipeline.include_resnet
@@ -1149,7 +1130,7 @@ class ADMD_TrainLora:
 
             torch.manual_seed(seed)
 
-            device = comfy.model_management.get_torch_device()
+            device = typing.cast(torch.device, comfy.model_management.get_torch_device())
             comfy.model_management.unload_all_models()
 
             unet = admd_pipeline.unet
@@ -1157,7 +1138,7 @@ class ADMD_TrainLora:
 
             unet.to(device)
             vae.to(device)
-            text_encoder.to(device)
+            text_encoder.to(device) # type: ignore
             unet.enable_gradient_checkpointing()
             unet.train()
 
@@ -1168,48 +1149,19 @@ class ADMD_TrainLora:
 
             target_temporal_modules = ["TemporalTransformerBlock"]
       
-            first_epoch = 0
-            gradient_accumulation_steps = 1
             global_step = admd_pipeline.global_step
             print(f"global_step: {global_step}")
             
-            
+            inputs: utils.scheduling.InputSchedule[Any, utils.inputs.TrainingVideo]
             # Get the text embedding for conditioning
             with torch.no_grad():
-                prompt_ids = [tokenizer(
-                    [txt], 
-                    max_length=tokenizer.model_max_length, 
-                    padding="max_length", 
-                    truncation=True, 
-                    return_tensors="pt"
-                ).input_ids.to(device) for txt in text_prompt]
-
-                #text encoding
-                text_encoder.to(device)
-                import transformers.modeling_outputs
-                encoder_hidden_states_list = [text_encoder(prompt_id)[0] for prompt_id in prompt_ids]
-                print("ENCODER STATES LIST: ", encoder_hidden_states_list)
-                text_encoder.to('cpu')
-
-                if opt_images_override is not None:
-                    pixel_values = opt_images_override
-
-                def to_latent(px: torch.Tensor):
-                    print("input batch shape:", px.shape)
-                    px = px * 2.0 - 1.0 #normalize to the expected range (-1, 1)
-                    px = px.permute(0, 3, 1, 2).unsqueeze(0)#B,H,W,C to B,F,C,H,W
-                    px = px.to(device)
-                    latents = tensor_to_vae_latent(px, vae)
-                    return (px, latents)
-
-                print(f"Received {len(pixel_values)} batche(s):")
-                pixel_list, latent_list = [list(s) for s in zip(*map(to_latent, pixel_values))]
-                pixel_list = typing.cast(torch.Tensor, pixel_list)
                 
-                batch_size = len(pixel_list)
-                
-                print("batch_size:", batch_size)
-                vae.to('cpu')
+                inputs = utils.scheduling.InputSchedule.prepare_dataset(
+                    input_sched, 
+                    vae=vae, 
+                    tokenizer=tokenizer, 
+                    text_encoder=text_encoder, device=device
+                )
 
                 #num_update_steps_per_epoch = math.ceil(batch_size) / gradient_accumulation_steps
                 #num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
@@ -1218,15 +1170,12 @@ class ADMD_TrainLora:
                 progress_bar.set_description("Steps")
                 pbar = comfy.utils.ProgressBar(steps)
 
-            pixel_cycle = itertools.cycle(pixel_list)
-            latent_cycle = itertools.cycle(latent_list)
-            encoder_hidden_states_cycle = itertools.cycle(encoder_hidden_states_list)
             ### <<<< Training <<<< ###
             #for epoch in range(first_epoch, steps):
-            for step in range(steps):
-                pixel_values = next(pixel_cycle)
-                latents = next(latent_cycle)
-                encoder_hidden_states = next(encoder_hidden_states_cycle)
+            for video in inputs.train(steps):
+                pixel_values = video.pixels
+                latents = video.latent
+                encoder_hidden_states = video.encoder_hidden_states
                 # encoder_hidden_states = next(encoder_hidden_states_cycle)
                 
                 spatial_scheduler_lr = 0.0
@@ -1267,7 +1216,7 @@ class ADMD_TrainLora:
                             scale_loras(loras, 0.)
                         
                         ### >>>> Spatial LoRA Prediction >>>> ###
-                        noisy_latents = train_noise_scheduler_spatial.add_noise(latents, noise, timesteps)
+                        noisy_latents = train_noise_scheduler_spatial.add_noise(latents, noise, timesteps) # type: ignore
                         noisy_latents_input, target_spatial = get_spatial_latents(
                             pixel_values,  
                             noisy_latents,
@@ -1282,7 +1231,7 @@ class ADMD_TrainLora:
                     scale_loras(loras, 1.0)
                     
                     ### >>>> Temporal LoRA Prediction >>>> ###
-                    noisy_latents = train_noise_scheduler.add_noise(latents, noise, timesteps)
+                    noisy_latents = train_noise_scheduler.add_noise(latents, noise, timesteps)  # type: ignore
                     model_pred = unet(noisy_latents, timesteps, encoder_hidden_states=encoder_hidden_states).sample
                     
                     loss_temporal = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -1290,18 +1239,18 @@ class ADMD_TrainLora:
                         
                     # Backpropagate
                     if not mask_spatial_lora:
-                        scaler.scale(loss_spatial).backward(retain_graph=True)
+                        scaler.scale(loss_spatial).backward(retain_graph=True)          # type: ignore
                         scaler.step(optimizer_spatial_list[0])
                                         
                     scaler.scale(loss_temporal).backward()
                     scaler.step(optimizer_temporal)
         
                     lr_scheduler_spatial_list[0].step()
-                    spatial_scheduler_lr = lr_scheduler_spatial_list[0].get_lr()[0]
+                    spatial_scheduler_lr = lr_scheduler_spatial_list[0].get_lr()[0]     # type: ignore
                         
                     if lr_scheduler_temporal is not None:
                         lr_scheduler_temporal.step()
-                        temporal_scheduler_lr = lr_scheduler_temporal.get_lr()[0]
+                        temporal_scheduler_lr = lr_scheduler_temporal.get_lr()[0]       # type: ignore
             
                 scaler.update()
                 progress_bar.update(1)
@@ -1329,7 +1278,7 @@ class ADMD_TrainLora:
 class ADMD_ValidationSampler:
 
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "validation_settings": ("VALIDATION_SETTINGS", ),
@@ -1350,8 +1299,6 @@ class ADMD_ValidationSampler:
             unet = admd_pipeline.unet
             text_encoder = admd_pipeline.text_encoder
             vae = admd_pipeline.vae
-            text_prompt = admd_pipeline.text_prompt
-            pixel_values = admd_pipeline.pixel_values
             
             validation_pipeline = admd_pipeline.validation_pipeline
           
@@ -1360,7 +1307,7 @@ class ADMD_ValidationSampler:
 
             unet.to(device)
             vae.to(device)
-            text_encoder.to(device)
+            text_encoder.to(device) # type: ignore
             
             validation_inference_steps = validation_settings["inference_steps"]
             validation_guidance_scale = validation_settings["guidance_scale"]
@@ -1383,10 +1330,7 @@ class ADMD_ValidationSampler:
                     scale_loras(loras, validation_spatial_scale)
                     
                     with torch.inference_mode(True):
-                        if len(validation_prompt) == 0:
-                            prompt = text_prompt
-                        else: 
-                            prompt = validation_prompt
+                        prompt = validation_prompt
                         
                         sample = validation_pipeline(
                             prompt,
@@ -1396,7 +1340,7 @@ class ADMD_ValidationSampler:
                             width        = width,
                             num_inference_steps = validation_inference_steps,
                             guidance_scale = validation_guidance_scale,
-                        ).videos
+                        ).videos # type: ignore
                         samples.append(sample)
                 # Reshape the sample tensor for returning
                 samples = torch.concat(samples)
@@ -1407,7 +1351,7 @@ class ADMD_ValidationSampler:
 class ADMD_MakeBatchList:
 
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "images": ("IMAGE", ),
